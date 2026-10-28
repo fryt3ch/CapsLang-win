@@ -33,7 +33,7 @@ Hooks `WH_KEYBOARD_LL` globally. Uses `unsafe` pointer access for zero-allocatio
 | **Long-press** (default, 300ms) | Tap CapsLock → language switch via `Win+Space` (`SendInput`). Hold CapsLock (300ms) → real CapsLock toggle. |
 | **Legacy** (`0` as arg) | CapsLock always switches language instantly. Press **Shift + CapsLock** for normal CapsLock toggle (passthrough). |
 
-A named mutex prevents multiple instances.
+A named mutex prevents multiple instances. Holding CapsLock in legacy mode switches the language only once per press.
 
 ## Command Line
 

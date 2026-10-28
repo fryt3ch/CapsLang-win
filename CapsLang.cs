@@ -3,11 +3,13 @@
 #:property AllowUnsafeBlocks=true
 
 using System.Runtime.InteropServices;
+using System.Threading;
 
 internal static unsafe partial class CapsLang
 {
     private const int WH_KEYBOARD_LL = 13;
     private const int WM_KEYDOWN = 0x0100;
+    private const uint WM_TIMER = 0x0113;
 
     private const int VK_CAPITAL = 0x14;
     private const int VK_SHIFT = 0x10;
@@ -23,11 +25,13 @@ internal static unsafe partial class CapsLang
     private static int _longPressMs = 300;
 
     private static int _capsState;
-    private static Timer? _longPressTimer;
+    private static nint _timerGeneration;
+    private static nint _activeTimer;
 
     private delegate nint LowLevelKeyboardProc(int nCode, nint wParam, nint lParam);
     private static readonly LowLevelKeyboardProc _hookProc = HookCallback;
 
+    private static readonly int _inputSize = Marshal.SizeOf<INPUT>();
     private static readonly INPUT[] _winSpaceInputs = BuildWinSpaceInputs();
 
     // ---- structs ----
@@ -52,11 +56,38 @@ internal static unsafe partial class CapsLang
         public nint dwExtraInfo;
     }
 
-    [StructLayout(LayoutKind.Explicit, Size = 40)]
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MOUSEINPUT
+    {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public nint dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct HARDWAREINPUT
+    {
+        public uint uMsg;
+        public ushort wParamL;
+        public ushort wParamH;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct INPUTUNION
+    {
+        [FieldOffset(0)] public MOUSEINPUT mi;
+        [FieldOffset(0)] public KEYBDINPUT ki;
+        [FieldOffset(0)] public HARDWAREINPUT hi;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct INPUT
     {
-        [FieldOffset(0)] public uint type;
-        [FieldOffset(8)] public KEYBDINPUT ki;
+        public uint type;
+        public INPUTUNION u;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -95,8 +126,7 @@ internal static unsafe partial class CapsLang
     private static partial uint SendInput(uint nInputs, [In] INPUT[] pInputs, int cbSize);
 
     [LibraryImport("user32.dll", EntryPoint = "GetMessageW", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static partial bool GetMessage(out MSG lpMsg, nint hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+    private static partial int GetMessage(out MSG lpMsg, nint hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
 
     [LibraryImport("user32.dll", EntryPoint = "TranslateMessage")]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -104,6 +134,13 @@ internal static unsafe partial class CapsLang
 
     [LibraryImport("user32.dll", EntryPoint = "DispatchMessageW")]
     private static partial nint DispatchMessage(in MSG lpMsg);
+
+    [LibraryImport("user32.dll", SetLastError = true)]
+    private static partial nint SetTimer(nint hWnd, nint nIDEvent, uint uElapse, nint lpTimerFunc);
+
+    [LibraryImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool KillTimer(nint hWnd, nint uIDEvent);
 
     // ---- entry ----
 
@@ -121,13 +158,23 @@ internal static unsafe partial class CapsLang
         if (hookId == 0)
             return;
 
-        while (GetMessage(out var msg, 0, 0, 0))
+        while (true)
         {
+            var result = GetMessage(out var msg, 0, 0, 0);
+            if (result <= 0)
+                break;
+
+            if (msg.message == WM_TIMER)
+            {
+                OnTimer(msg.wParam);
+                continue;
+            }
+
             TranslateMessage(in msg);
             DispatchMessage(in msg);
         }
 
-        _longPressTimer?.Dispose();
+        KillActiveTimer();
         UnhookWindowsHookEx(hookId);
     }
 
@@ -147,7 +194,10 @@ internal static unsafe partial class CapsLang
             return CallNextHookEx(0, nCode, wParam, lParam);
 
         if (_longPressMs == 0 && GetKeyState(VK_SHIFT) < 0)
+        {
+            Interlocked.Exchange(ref _capsState, 0);
             return CallNextHookEx(0, nCode, wParam, lParam);
+        }
 
         if (wParam == WM_KEYDOWN)
             OnCapsKeyDown();
@@ -163,43 +213,64 @@ internal static unsafe partial class CapsLang
     {
         if (_longPressMs == 0)
         {
-            ToggleInputLanguage();
+            if (Interlocked.CompareExchange(ref _capsState, 1, 0) == 0)
+                ToggleInputLanguage();
             return;
         }
 
         if (Interlocked.CompareExchange(ref _capsState, 1, 0) != 0)
             return;
 
-        _longPressTimer?.Dispose();
-        _longPressTimer = new Timer(
-            _ =>
-            {
-                if (Interlocked.CompareExchange(ref _capsState, 2, 1) == 1)
-                    ToggleCapsLock();
-            },
-            null,
-            _longPressMs,
-            Timeout.Infinite);
+        KillActiveTimer();
+
+        _timerGeneration++;
+        if (_timerGeneration == 0)
+            _timerGeneration++;
+
+        _activeTimer = SetTimer(0, _timerGeneration, (uint)_longPressMs, 0);
     }
 
     private static void OnCapsKeyUp()
     {
         if (_longPressMs == 0)
+        {
+            Interlocked.Exchange(ref _capsState, 0);
             return;
+        }
 
+        KillActiveTimer();
         var prevState = Interlocked.Exchange(ref _capsState, 0);
-        _longPressTimer?.Dispose();
-        _longPressTimer = null;
 
         if (prevState == 1)
             ToggleInputLanguage();
+    }
+
+    private static void OnTimer(nint timerId)
+    {
+        if (timerId != _activeTimer)
+            return;
+
+        _activeTimer = 0;
+        KillTimer(0, timerId);
+
+        if (Interlocked.CompareExchange(ref _capsState, 2, 1) == 1)
+            ToggleCapsLock();
+    }
+
+    private static void KillActiveTimer()
+    {
+        var timerId = _activeTimer;
+        _activeTimer = 0;
+
+        if (timerId != 0)
+            KillTimer(0, timerId);
     }
 
     // ---- language switching ----
 
     private static void ToggleInputLanguage()
     {
-        SendInput((uint)_winSpaceInputs.Length, _winSpaceInputs, Marshal.SizeOf<INPUT>());
+        SendInput((uint)_winSpaceInputs.Length, _winSpaceInputs, _inputSize);
     }
 
     // ---- caps lock toggle ----
@@ -212,7 +283,7 @@ internal static unsafe partial class CapsLang
             MakeKeyInput(VK_CAPITAL, KEYEVENTF_KEYUP, CAPS_INJECTION_TAG),
         ];
 
-        SendInput(2, inputs, Marshal.SizeOf<INPUT>());
+        SendInput(2, inputs, _inputSize);
     }
 
     // ---- helpers ----
@@ -233,11 +304,14 @@ internal static unsafe partial class CapsLang
         return new INPUT
         {
             type = INPUT_KEYBOARD,
-            ki = new KEYBDINPUT
+            u = new INPUTUNION
             {
-                wVk = vk,
-                dwFlags = flags,
-                dwExtraInfo = extraInfo,
+                ki = new KEYBDINPUT
+                {
+                    wVk = vk,
+                    dwFlags = flags,
+                    dwExtraInfo = extraInfo,
+                },
             },
         };
     }
